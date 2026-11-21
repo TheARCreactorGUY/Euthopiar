@@ -279,6 +279,10 @@ class PlayerViewModel(
     private var currentPosterUrl: String? = null
     private var currentBackdropUrl: String? = null
     private var lastProgressSaveTimestamp: Long = 0L
+    private var lastScrobbleTimestampMs: Long = 0L
+    private var lastScrobbleAction: String? = null
+    private var lastScrobbleMediaKey: String? = null
+    private var completedScrobbleKey: String? = null
     private var resumeDismissJob: Job? = null
     private var currentCanonicalStream: com.euthopiar.core.model.CanonicalStream? = null
     fun getCurrentCanonicalStream(): com.euthopiar.core.model.CanonicalStream? = currentCanonicalStream
@@ -959,7 +963,12 @@ class PlayerViewModel(
                     }
                     Player.STATE_ENDED -> {
                         _uiState.update { it.copy(isBuffering = false, isPlaying = false) }
-                        playbackSyncCoordinator.onPlaybackEndedOrExited()
+                        val endSaveJob = savePlaybackProgress(
+                            notifyCloud = false,
+                            triggerScrobble = true,
+                            scrobbleAction = "stop"
+                        )
+                        playbackSyncCoordinator.onPlaybackEndedOrExited(endSaveJob)
                         if (_uiState.value.selectedSleepTimer == SleepTimerOption.END_OF_EPISODE) {
                             _uiState.update { it.copy(selectedSleepTimer = SleepTimerOption.OFF) }
                             showToast("Bedtime sleep timer: paused at end of episode")
@@ -988,8 +997,18 @@ class PlayerViewModel(
                     applyDialogueBoost()
                     applyNightModeDrc()
                     playbackSyncCoordinator.onPlaybackResumed()
+                    val pos = exoPlayer?.currentPosition ?: _uiState.value.currentPositionMs
+                    val dur = exoPlayer?.duration?.takeIf { it > 0L } ?: _uiState.value.durationMs
+                    val pct = if (dur > 0L) (pos.toFloat() / dur.toFloat()) * 100f else 0f
+                    persistenceScope.launch {
+                        dispatchScrobble("start", pct, forceAction = false)
+                    }
                 } else {
-                    savePlaybackProgress()
+                    savePlaybackProgress(
+                        notifyCloud = false,
+                        triggerScrobble = true,
+                        scrobbleAction = "pause"
+                    )
                     playbackSyncCoordinator.onPlaybackPaused()
                 }
             }
@@ -2622,7 +2641,20 @@ class PlayerViewModel(
                         }
                     }
 
+                    val allowP2p = com.euthopiar.core.p2p.P2pSettingsRepository.isP2pEnabled()
                     if (apiKey.isBlank()) {
+                        if (!allowP2p) {
+                            val err = "P2P streams are disabled in settings (configure Debrid or enable P2P)"
+                            val srv = _uiState.value.selectedServer
+                            if (srv != null) failedServerIds.add(srv.id)
+                            if (_uiState.value.smartFailoverEnabled) {
+                                triggerFailover(err)
+                            } else {
+                                showToast(err)
+                                _uiState.update { it.copy(isLoading = false, isBuffering = false, userError = com.euthopiar.ui.util.UserError.SourceUnavailable, errorMessage = err) }
+                            }
+                            return@launch
+                        }
                         // Route through P2P Streaming Engine when no Debrid key is present
                         val p2pRequest = extractP2pStreamRequest(
                             rawUrl = currentSource.url,
@@ -2688,15 +2720,17 @@ class PlayerViewModel(
                                 container = if (currentSource.container != com.euthopiar.core.model.StreamContainer.AUTO) currentSource.container else resolved.container
                             )
                         } else {
-                            // If Debrid resolution fails, attempt fallback to native P2P engine
-                            val p2pRequest = extractP2pStreamRequest(
-                                rawUrl = currentSource.url,
-                                fallbackInfoHash = currentSource.infoHash,
-                                defaultFileIdx = currentSource.fileIdx,
-                                defaultSeason = currentSource.season,
-                                defaultEpisode = currentSource.episode,
-                                trackers = currentSource.trackers
-                            )
+                            // If Debrid resolution fails, attempt fallback to native P2P engine only if P2P is allowed
+                            val p2pRequest = if (allowP2p) {
+                                extractP2pStreamRequest(
+                                    rawUrl = currentSource.url,
+                                    fallbackInfoHash = currentSource.infoHash,
+                                    defaultFileIdx = currentSource.fileIdx,
+                                    defaultSeason = currentSource.season,
+                                    defaultEpisode = currentSource.episode,
+                                    trackers = currentSource.trackers
+                                )
+                            } else null
                             if (p2pRequest != null) {
                                 try {
                                     com.euthopiar.core.p2p.P2pStreamingEngine.initialize(getApplication())
@@ -2718,13 +2752,14 @@ class PlayerViewModel(
                                     return@launch
                                 }
                             } else {
-                                val err = resolveResult.exceptionOrNull()?.message ?: "Unknown Debrid error"
+                                val err = resolveResult.exceptionOrNull()?.message
+                                    ?: if (!allowP2p) "Debrid failed (P2P fallback disabled)" else "Unknown Debrid error"
                                 val srv = _uiState.value.selectedServer
                                 if (srv != null) failedServerIds.add(srv.id)
                                 if (_uiState.value.smartFailoverEnabled) {
                                     triggerFailover(err)
                                 } else {
-                                    showToast("Debrid resolution failed: $err")
+                                    showToast(if (!allowP2p) err else "Debrid resolution failed: $err")
                                     _uiState.update { it.copy(isLoading = false, isBuffering = false, userError = com.euthopiar.ui.util.UserError.SourceUnavailable, errorMessage = err) }
                                 }
                                 return@launch
@@ -4634,7 +4669,7 @@ class PlayerViewModel(
         _uiState.update { it.copy(currentPositionMs = clamped, isScrubbing = false) }
         updateSubtitleForPosition(clamped)
         resetAutoHideTimer()
-        savePlaybackProgress()
+        savePlaybackProgress(notifyCloud = false, triggerScrobble = false)
     }
 
     fun seekRelative(deltaMs: Long) {
@@ -4780,7 +4815,7 @@ class PlayerViewModel(
     }
 
     fun playNextEpisode() {
-        savePlaybackProgress()
+        savePlaybackProgress(notifyCloud = false, triggerScrobble = true)
         val curSeason = _uiState.value.seasonNumber ?: 1
         val curEpisode = _uiState.value.episodeNumber ?: 1
         val eps = loadedEpisodes.ifEmpty { _uiState.value.availableEpisodes }
@@ -4799,7 +4834,7 @@ class PlayerViewModel(
     }
 
     fun playPrevEpisode() {
-        savePlaybackProgress()
+        savePlaybackProgress(notifyCloud = false, triggerScrobble = true)
         val curSeason = _uiState.value.seasonNumber ?: 1
         val curEpisode = _uiState.value.episodeNumber ?: 1
         val eps = loadedEpisodes.ifEmpty { _uiState.value.availableEpisodes }
@@ -4985,7 +5020,7 @@ class PlayerViewModel(
             setEpisodeSelectorOpen(false)
             return
         }
-        savePlaybackProgress()
+        savePlaybackProgress(notifyCloud = false, triggerScrobble = true)
         setEpisodeSelectorOpen(false)
         val mediaId = currentMediaId ?: return
         loadStream(
@@ -5279,7 +5314,7 @@ class PlayerViewModel(
                     val now = System.currentTimeMillis()
                     if (now - lastProgressSaveTimestamp >= 5000L && player.isPlaying && pos > 0L && deferred == null) {
                         lastProgressSaveTimestamp = now
-                        savePlaybackProgress()
+                        savePlaybackProgress(notifyCloud = false, triggerScrobble = false)
                     }
                 }
                 val currentSpeed = exoPlayer?.playbackParameters?.speed ?: 1.0f
@@ -5571,6 +5606,34 @@ class PlayerViewModel(
         }
     }
 
+    private fun dispatchScrobble(action: String, progressPercent: Float, forceAction: Boolean = false) {
+        val mediaId = currentMediaId ?: return
+        val profileType = com.euthopiar.data.profile.ProfileManager.getInstance(getApplication()).activeProfile.value?.type
+        if (!com.euthopiar.data.sync.TrackerReconciliationPolicy.shouldSyncTrackersForProfile(profileType)) return
+
+        val mediaKey = "${mediaId}_s${_uiState.value.seasonNumber ?: -1}_e${_uiState.value.episodeNumber ?: -1}"
+        synchronized(this) {
+            if (action == "start" && progressPercent < 10f && completedScrobbleKey == mediaKey) {
+                completedScrobbleKey = null
+            }
+            if (action == "stop" && completedScrobbleKey == mediaKey) return
+
+            val now = System.currentTimeMillis()
+            if (!forceAction && action == lastScrobbleAction && mediaKey == lastScrobbleMediaKey && now - lastScrobbleTimestampMs < 15_000L) {
+                return
+            }
+            lastScrobbleTimestampMs = now
+            lastScrobbleAction = action
+            lastScrobbleMediaKey = mediaKey
+            if (action == "stop") {
+                completedScrobbleKey = mediaKey
+            }
+        }
+
+        scrobbleToTrakt(action, progressPercent)
+        scrobbleToSimkl(action, progressPercent)
+    }
+
     private fun scrobbleToTrakt(action: String, progressPercent: Float) {
         persistenceScope.launch {
             try {
@@ -5609,54 +5672,18 @@ class PlayerViewModel(
                 }
                 val result = com.euthopiar.core.sync.trakt.TraktClient.getInstance().scrobble(action, token, body)
                 if (result.isFailure && result.exceptionOrNull()?.message?.contains("401") == true) {
-                    val refreshToken = preferencesRepository.traktRefreshToken.first()
-                    if (refreshToken.isNotBlank()) {
-                        val refreshed = refreshTraktTokenIfNeeded(refreshToken)
-                        if (!refreshed.isNullOrBlank()) {
-                            com.euthopiar.core.sync.trakt.TraktClient.getInstance().scrobble(action, refreshed, body)
-                        }
+                    val refreshed = com.euthopiar.data.sync.MediaSyncManager
+                        .getInstance(getApplication())
+                        .refreshTraktTokenOnUnauthorized(token)
+                    if (!refreshed.isNullOrBlank()) {
+                        com.euthopiar.core.sync.trakt.TraktClient.getInstance().scrobble(action, refreshed, body)
                     }
                 }
             } catch (_: Exception) {}
         }
     }
 
-    private suspend fun refreshTraktTokenIfNeeded(refreshToken: String): String? = withContext(Dispatchers.IO) {
-        try {
-            val payload = org.json.JSONObject().apply {
-                put("refresh_token", refreshToken)
-                put("client_id", com.euthopiar.core.sync.trakt.TraktClient.DEFAULT_CLIENT_ID)
-                put("client_secret", com.euthopiar.core.sync.trakt.TraktClient.DEFAULT_CLIENT_SECRET)
-                put("redirect_uri", com.euthopiar.core.sync.trakt.TraktClient.REDIRECT_URI)
-                put("grant_type", "refresh_token")
-            }
-            val mediaType = with(okhttp3.MediaType.Companion) { "application/json; charset=utf-8".toMediaType() }
-            val body = with(okhttp3.RequestBody.Companion) { payload.toString().toRequestBody(mediaType) }
-            val req = okhttp3.Request.Builder()
-                .url("${com.euthopiar.core.sync.trakt.TraktClient.BASE_URL}/oauth/token")
-                .header("Content-Type", "application/json")
-                .post(body)
-                .build()
-            com.euthopiar.core.network.DohDns.sharedBaseClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val raw = resp.body?.string().orEmpty()
-                    val json = org.json.JSONObject(raw)
-                    val newAccess = json.optString("access_token")
-                    val newRefresh = json.optString("refresh_token").ifBlank { refreshToken }
-                    if (newAccess.isNotBlank()) {
-                        val currentUsername = preferencesRepository.traktUsername.first()
-                        preferencesRepository.setTraktAuth(newAccess, newRefresh, currentUsername)
-                        return@withContext newAccess
-                    }
-                }
-            }
-            null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun scrobbleToSimkl(progressPercent: Float) {
+    private fun scrobbleToSimkl(action: String, progressPercent: Float) {
         persistenceScope.launch {
             try {
                 val token = preferencesRepository.simklAccessToken.first()
@@ -5668,6 +5695,7 @@ class PlayerViewModel(
                 val tmdbLong = cleanId?.toLongOrNull()
                 val imdbStr = currentImdbId?.takeIf { it.startsWith("tt") } ?: cleanId?.takeIf { it.startsWith("tt") }
                 val simklIds = com.euthopiar.core.sync.simkl.SimklIds(tmdb = tmdbLong, imdb = imdbStr)
+                val clampedProgress = progressPercent.coerceIn(0f, 100f)
                 val payload = if (isTv) {
                     com.euthopiar.core.sync.simkl.SimklScrobblePayload(
                         show = com.euthopiar.core.sync.simkl.SimklScrobbleItem(
@@ -5679,7 +5707,7 @@ class PlayerViewModel(
                             season = _uiState.value.seasonNumber ?: 1,
                             number = _uiState.value.episodeNumber ?: 1
                         ),
-                        progress = progressPercent
+                        progress = clampedProgress
                     )
                 } else {
                     com.euthopiar.core.sync.simkl.SimklScrobblePayload(
@@ -5688,22 +5716,25 @@ class PlayerViewModel(
                             year = currentYear,
                             ids = simklIds
                         ),
-                        progress = progressPercent
+                        progress = clampedProgress
                     )
                 }
-                com.euthopiar.core.sync.simkl.SimklClient.getInstance().scrobble(token, payload)
-                val toStatus = if (progressPercent >= 90f) "completed" else "watching"
-                val syncItem = com.euthopiar.core.sync.simkl.SimklSyncItem(
-                    title = _uiState.value.mediaTitle,
-                    to = toStatus,
-                    ids = simklIds
-                )
-                val listPayload = if (isTv) {
-                    com.euthopiar.core.sync.simkl.SimklSyncPayload(shows = listOf(syncItem))
-                } else {
-                    com.euthopiar.core.sync.simkl.SimklSyncPayload(movies = listOf(syncItem))
+                com.euthopiar.core.sync.simkl.SimklClient.getInstance().scrobble(action, token, payload)
+
+                if (action == "pause" || action == "stop") {
+                    val toStatus = if (!isTv && clampedProgress >= 90f) "completed" else "watching"
+                    val syncItem = com.euthopiar.core.sync.simkl.SimklSyncItem(
+                        title = _uiState.value.mediaTitle,
+                        to = toStatus,
+                        ids = simklIds
+                    )
+                    val listPayload = if (isTv) {
+                        com.euthopiar.core.sync.simkl.SimklSyncPayload(shows = listOf(syncItem))
+                    } else {
+                        com.euthopiar.core.sync.simkl.SimklSyncPayload(movies = listOf(syncItem))
+                    }
+                    com.euthopiar.core.sync.simkl.SimklClient.getInstance().addToLibrary(token, listPayload)
                 }
-                com.euthopiar.core.sync.simkl.SimklClient.getInstance().addToLibrary(token, listPayload)
             } catch (_: Exception) {}
         }
     }
@@ -5829,7 +5860,11 @@ class PlayerViewModel(
         } catch (_: Exception) {}
     }
 
-    fun savePlaybackProgress(): Job? {
+    fun savePlaybackProgress(
+        notifyCloud: Boolean = false,
+        triggerScrobble: Boolean = false,
+        scrobbleAction: String? = null
+    ): Job? {
         if (isCurrentLiveStream || currentType == MediaType.LIVE_TV || _uiState.value.isLiveStream) return null
         val mediaId = currentMediaId ?: return null
         if (pendingDeferredSeekMs != null) return null
@@ -5842,6 +5877,22 @@ class PlayerViewModel(
         val s = if (isTv) _uiState.value.seasonNumber else null
         val e = if (isTv) _uiState.value.episodeNumber else null
         val epTitle = if (isTv) _uiState.value.episodeTitle else null
+
+        val progressPercent = if (duration > 0L) (pos.toFloat() / duration.toFloat()) * 100f else 0f
+        val isCompletedThreshold = duration > 0L && pos >= duration * 0.9f
+        val resolvedAction = when {
+            isCompletedThreshold -> "stop"
+            scrobbleAction != null -> scrobbleAction
+            else -> "pause"
+        }
+
+        if (triggerScrobble) {
+            dispatchScrobble(
+                action = resolvedAction,
+                progressPercent = progressPercent,
+                forceAction = (resolvedAction == "stop" || scrobbleAction == null)
+            )
+        }
 
         return persistenceScope.launch {
             libraryRepository.updatePlaybackProgress(
@@ -5856,11 +5907,9 @@ class PlayerViewModel(
                 posterUrl = currentPosterUrl,
                 provider = currentProvider ?: _uiState.value.providerName,
                 mediaType = currentType.name,
-                episodeData = currentEpisodeData
+                episodeData = currentEpisodeData,
+                notifyCloud = notifyCloud
             )
-            val progressPercent = if (duration > 0L) (pos.toFloat() / duration.toFloat()) * 100f else 0f
-            scrobbleToTrakt(if (pos >= duration * 0.9f) "stop" else "pause", progressPercent)
-            scrobbleToSimkl(progressPercent)
         }
     }
 
@@ -5877,7 +5926,7 @@ class PlayerViewModel(
     }
 
     fun onExitPlayer() {
-        val saveJob = savePlaybackProgress()
+        val saveJob = savePlaybackProgress(notifyCloud = false, triggerScrobble = true)
         playbackSyncCoordinator.onPlaybackEndedOrExited(saveJob)
         seekDebounceJob?.cancel()
         pendingSeekTargetMs = null
@@ -5889,9 +5938,20 @@ class PlayerViewModel(
         try {
             com.euthopiar.core.network.PlayerPlaybackNetworking.cancelLoopbackPlaybackCalls()
         } catch (_: Throwable) {}
+        val hadP2p = _uiState.value.isP2pStream
         try {
             com.euthopiar.core.p2p.P2pStreamingEngine.stopStream(evictTorrent = true)
         } catch (_: Throwable) {}
+        if (hadP2p) {
+            persistenceScope.launch {
+                try {
+                    if (preferencesRepository.autoClearP2pOnExit.first()) {
+                        delay(450L)
+                        com.euthopiar.data.cache.AppCacheManager.cleanP2pCacheIfIdle(getApplication())
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
         p2pStateJob?.cancel()
         tickerJob?.cancel()
         autoHideJob?.cancel()

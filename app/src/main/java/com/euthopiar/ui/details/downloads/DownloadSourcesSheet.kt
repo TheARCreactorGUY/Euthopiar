@@ -122,9 +122,15 @@ fun DownloadSourcesSheet(
     val allDebridApiKey by preferencesRepository.allDebridApiKey.collectAsState(initial = "")
     val torBoxApiKey by preferencesRepository.torBoxApiKey.collectAsState(initial = "")
     val firstDownloadAlertDismissed by preferencesRepository.firstDownloadAlertDismissed.collectAsState(initial = false)
+    val p2pSettingsUi by com.euthopiar.core.p2p.P2pSettingsRepository.uiState.collectAsState()
+    val p2pEnabled = p2pSettingsUi.p2pEnabled
+    val hasActiveDebrid = isDebridEnabled && activeDebridProvider != "NONE" &&
+        (realDebridApiKey.isNotBlank() || allDebridApiKey.isNotBlank() || torBoxApiKey.isNotBlank())
 
-    LaunchedEffect(Unit) {
-        com.euthopiar.core.p2p.P2pStreamingEngine.prewarmEngine(context)
+    LaunchedEffect(p2pEnabled) {
+        if (p2pEnabled) {
+            com.euthopiar.core.p2p.P2pStreamingEngine.prewarmEngine(context)
+        }
     }
 
     var pendingStreamToDownload by remember { mutableStateOf<Pair<StreamItem, String>?>(null) }
@@ -174,9 +180,14 @@ fun DownloadSourcesSheet(
     }
 
     val streamsUiState by StreamsRepository.uiState.collectAsState()
-    val availableStreams = remember(streamsUiState.groups) {
+    val availableStreams = remember(streamsUiState.groups, p2pEnabled, hasActiveDebrid) {
         val valid = streamsUiState.allStreams.filter { stream ->
-            stream.isSupportedDownloadUrl() || (stream.isTorrentStream && !stream.effectiveMagnetOrHash.isNullOrBlank())
+            val allowedByPolicy = com.euthopiar.core.p2p.P2pStreamPolicy.shouldIncludeStream(
+                isTorrentStream = stream.isTorrentStream,
+                p2pEnabled = p2pEnabled,
+                hasActiveDebrid = hasActiveDebrid
+            )
+            allowedByPolicy && (stream.isSupportedDownloadUrl() || (stream.isTorrentStream && !stream.effectiveMagnetOrHash.isNullOrBlank()))
         }.sortedForGroupedDisplay()
         val seen = HashSet<String>()
         valid.filter { stream ->
@@ -251,6 +262,7 @@ fun DownloadSourcesSheet(
                     episode = effectiveEpisode,
                     stream = stream,
                     debrid = debrid,
+                    allowP2pFallback = p2pEnabled,
                     onProgressNotice = onDownloadStarted
                 )
                 handleEnqueueResult(outcome.preflight, outcome.statusMessage)
@@ -346,6 +358,7 @@ fun DownloadSourcesSheet(
             activeDownloadState = activeDownloadState,
             runtimeMinutes = runtimeMin,
             isAnyLoading = streamsUiState.isAnyLoading,
+            showP2pTab = p2pEnabled || hasActiveDebrid,
             onDownloadClick = handleStreamDownload,
             onLongClick = onLongClickCopy,
             onRetry = onRetry
@@ -410,6 +423,7 @@ fun EditorialDownloadContent(
     modifier: Modifier = Modifier,
     runtimeMinutes: Int = 120,
     isAnyLoading: Boolean = false,
+    showP2pTab: Boolean = true,
     onLongClick: ((StreamItem) -> Unit)? = null,
     onRetry: () -> Unit = {}
 ) {
@@ -417,13 +431,17 @@ fun EditorialDownloadContent(
     val configuration = LocalConfiguration.current
     val maxSheetHeight = (configuration.screenHeightDp * DownloadTokens.sheetMaxHeightRatio).dp
 
-    // Tabs: Always show "All", "P2P", and "Direct" filter tabs.
-    // Retain tabs visibility stably across all loading states so they never jump or disappear.
-    val availableTabs = remember {
-        listOf(DownloadTab.ALL, DownloadTab.P2P, DownloadTab.DIRECT)
+    val availableTabs = remember(showP2pTab) {
+        if (showP2pTab) listOf(DownloadTab.ALL, DownloadTab.P2P, DownloadTab.DIRECT)
+        else listOf(DownloadTab.ALL, DownloadTab.DIRECT)
     }
 
     var selectedTab by remember { mutableStateOf(DownloadTab.ALL) }
+    LaunchedEffect(showP2pTab) {
+        if (!showP2pTab && selectedTab == DownloadTab.P2P) {
+            selectedTab = DownloadTab.ALL
+        }
+    }
 
     // Filter streams by active tab
     val filteredStreams = remember(allStreams.toList(), selectedTab) {

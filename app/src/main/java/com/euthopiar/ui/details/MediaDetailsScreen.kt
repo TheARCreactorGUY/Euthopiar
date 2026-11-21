@@ -110,6 +110,8 @@ import androidx.compose.material.icons.outlined.PlaylistAdd
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Tv
+import androidx.compose.material.icons.outlined.CastConnected
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.MoreVert
 import com.euthopiar.download.DownloadItem
@@ -344,6 +346,53 @@ fun MediaDetailsScreen(
     var showTrailerDialog by remember { mutableStateOf(false) }
     var episodeToDownload by remember { mutableStateOf<EpisodeItem?>(null) }
 
+    var showTvCompanionSheet by remember { mutableStateOf(false) }
+    var pendingTvHandoff by remember { mutableStateOf<com.euthopiar.data.tv.TvHandoffPayload?>(null) }
+    val tvCoroutineScope = rememberCoroutineScope()
+    val tvManager = remember { com.euthopiar.data.tv.TvCompanionManager.getInstance(context) }
+    val tvConnState by tvManager.connectionState.collectAsState()
+    val openPlayOnTv: (
+        com.euthopiar.core.model.MediaDetail,
+        EpisodeItem?,
+        com.euthopiar.data.local.PlaybackHistoryEntity?
+    ) -> Unit = { detailItem, targetEp, resumePlayback ->
+        val activeProfileId = com.euthopiar.data.profile.ProfileManager
+            .getInstance(context)
+            .activeProfile
+            .value
+            .id
+            .ifBlank { "default_user" }
+        val payload = com.euthopiar.data.tv.TvHandoffPayload(
+            action = "play",
+            mediaId = detailItem.id,
+            title = detailItem.title,
+            mediaType = detailItem.type.name,
+            provider = provider,
+            episodeData = targetEp?.data,
+            episodeTitle = targetEp?.title,
+            seasonNumber = targetEp?.seasonNumber,
+            episodeNumber = targetEp?.episodeNumber,
+            positionMs = resumePlayback?.currentPositionMs ?: 0L,
+            durationMs = resumePlayback?.durationMs ?: 0L,
+            posterUrl = detailItem.posterUrl ?: detailItem.backdropUrl,
+            backdropUrl = detailItem.backdropUrl ?: detailItem.posterUrl,
+            profileId = activeProfileId
+        )
+        pendingTvHandoff = payload
+        if (tvConnState == com.euthopiar.data.tv.TvConnectionState.CONNECTED) {
+            tvCoroutineScope.launch {
+                val res = tvManager.playOnTv(payload)
+                if (res.isSuccess) {
+                    snackbarController.show("Sent \"${detailItem.title}\" to Euthopiar TV")
+                    pendingTvHandoff = null
+                } else {
+                    snackbarController.show(res.exceptionOrNull()?.message ?: "Could not reach Euthopiar TV")
+                }
+            }
+        }
+        showTvCompanionSheet = true
+    }
+
     val connectivityManager = remember { context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager }
     val isMetered = try { connectivityManager?.isActiveNetworkMetered == true } catch (_: Exception) { false }
     val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
@@ -563,6 +612,8 @@ fun MediaDetailsScreen(
                                         },
                                         onTrailer = if (!detail.trailerUrl.isNullOrBlank()) { { showTrailerDialog = true } } else null,
                                         onPlaylist = { showAddToPlaylistSheet = true },
+                                        onPlayOnTv = { openPlayOnTv(detail, targetEpisodeForPlay, resumePlaybackForPlay) },
+                                        isTvConnected = tvConnState == com.euthopiar.data.tv.TvConnectionState.CONNECTED,
                                         onShowMessage = { snackbarController.show(it) }
                                     )
 
@@ -909,6 +960,8 @@ fun MediaDetailsScreen(
                                             },
                                             onTrailer = if (!detail.trailerUrl.isNullOrBlank()) { { showTrailerDialog = true } } else null,
                                             onPlaylist = { showAddToPlaylistSheet = true },
+                                            onPlayOnTv = { openPlayOnTv(detail, targetEpisodeForPlay, resumePlaybackForPlay) },
+                                            isTvConnected = tvConnState == com.euthopiar.data.tv.TvConnectionState.CONNECTED,
                                             hazeState = detailsHazeState,
                                             onShowMessage = { snackbarController.show(it) }
                                         )
@@ -1374,6 +1427,15 @@ fun MediaDetailsScreen(
                 },
                 onPlaylistAction = { msg -> snackbarController.show(msg) },
                 onDismiss = { showWatchlistSheet = false }
+            )
+        }
+
+        // Euthopiar TV Companion Sheet
+        if (showTvCompanionSheet) {
+            com.euthopiar.ui.tv.TvCompanionSheet(
+                pendingHandoff = pendingTvHandoff,
+                onHandoffSent = { pendingTvHandoff = null },
+                onDismiss = { showTvCompanionSheet = false }
             )
         }
 
@@ -2267,6 +2329,8 @@ private fun DetailsActionBlock(
     onShare: () -> Unit,
     onTrailer: (() -> Unit)? = null,
     onPlaylist: (() -> Unit)? = null,
+    onPlayOnTv: (() -> Unit)? = null,
+    isTvConnected: Boolean = false,
     hazeState: HazeState? = null,
     onShowMessage: (String) -> Unit = {}
 ) {
@@ -2502,6 +2566,19 @@ private fun DetailsActionBlock(
                 hazeState = hazeState,
                 modifier = Modifier.weight(1f)
             )
+
+            // Play on Euthopiar TV Action
+            if (onPlayOnTv != null) {
+                ActionButtonItem(
+                    icon = if (isTvConnected) Icons.Outlined.CastConnected else Icons.Outlined.Tv,
+                    label = "TV",
+                    onClick = onPlayOnTv,
+                    isActive = isTvConnected,
+                    showDot = isTvConnected,
+                    hazeState = hazeState,
+                    modifier = Modifier.weight(1f)
+                )
+            }
 
             // Trailer Action
             if (onTrailer != null) {

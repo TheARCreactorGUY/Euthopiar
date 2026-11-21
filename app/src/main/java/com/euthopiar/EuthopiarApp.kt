@@ -33,7 +33,6 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
 
         // Initialize 50MB HTTP disk cache and connection pool
         DohDns.initHttpCache(cacheDir)
-        com.euthopiar.ui.player.sequential.SequentialStreamManager.cleanOrphanedCache(this)
 
         // Synchronously initialize JsPluginStorage, AddonRepository, and P2P engine instances
         com.euthopiar.core.js.JsPluginStorage.getInstance(this)
@@ -42,8 +41,21 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
         com.euthopiar.core.p2p.P2pSettingsRepository.initialize(this)
         com.euthopiar.core.browser.HeadlessWebResolver.getInstance(this)
 
-        // Initialize plugins, prefetch DNS, and restore default selected provider across restarts
+        // Initialize plugins, run smart cache maintenance, sync P2P policy, prefetch DNS & restore provider
         CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val prefsRepo = PreferencesRepository.getInstance(this@EuthopiarApp)
+                com.euthopiar.core.p2p.P2pSettingsRepository.setP2pEnabled(prefsRepo.p2pStreamsEnabled.first())
+                launch {
+                    prefsRepo.p2pStreamsEnabled.collect { enabled ->
+                        com.euthopiar.core.p2p.P2pSettingsRepository.setP2pEnabled(enabled)
+                    }
+                }
+            } catch (_: Exception) {}
+
+            try {
+                com.euthopiar.data.cache.AppCacheManager.runAutomaticMaintenance(this@EuthopiarApp)
+            } catch (_: Exception) {}
             try {
                 com.euthopiar.core.js.JsPluginStorage.getInstance(this@EuthopiarApp).initialize()
                 com.euthopiar.core.addons.AddonRepository.getInstance(this@EuthopiarApp).initialize()
@@ -127,13 +139,6 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
                     android.util.Log.w("EuthopiarApp", "Startup plugin auto-update error: ${e.message}")
                 }
             }
-
-            launch(Dispatchers.IO) {
-                try {
-                    com.euthopiar.data.sync.MediaSyncManager.getInstance(this@EuthopiarApp)
-                        .repairMissingLocalPosters()
-                } catch (_: Exception) {}
-            }
         }
     }
 
@@ -190,11 +195,21 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDir.resolve("image_cache").toOkioPath())
-                    .maxSizeBytes(250L * 1024 * 1024)
+                    .maxSizeBytes(com.euthopiar.data.cache.AppCacheManager.getCoilDiskCacheCapBytes(this))
                     .build()
             }
             .bitmapConfig(Bitmap.Config.HARDWARE)
             .crossfade(220)
             .build()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            runCatching {
+                coil3.SingletonImageLoader.get(this).memoryCache?.clear()
+            }
+        }
     }
 }
