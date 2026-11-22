@@ -10,7 +10,7 @@
 
 <br/>
 
-[![Latest Release](https://img.shields.io/badge/Release-v1.3.0--Stable-E50914?style=for-the-badge&logo=github&logoColor=white)](https://github.com/TheARCreactorGUY/Euthopiar/releases/latest)
+[![Latest Release](https://img.shields.io/badge/Release-v1.3.1--Stable-E50914?style=for-the-badge&logo=github&logoColor=white)](https://github.com/TheARCreactorGUY/Euthopiar/releases/latest)
 [![Platform](https://img.shields.io/badge/Android-Available-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/TheARCreactorGUY/Euthopiar/releases/latest)
 [![Android TV](https://img.shields.io/badge/Android%20TV-Available-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/TheARCreactorGUY/EuthopiarTV)
 [![Kotlin](https://img.shields.io/badge/Kotlin-100%25-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
@@ -163,7 +163,7 @@ flowchart LR
 
 <div align="center">
 
-[![Download Latest](https://img.shields.io/badge/⬇%20%20GET%20v1.3.0--Stable-E50914?style=for-the-badge)](https://github.com/TheARCreactorGUY/Euthopiar/releases/latest)
+[![Download Latest](https://img.shields.io/badge/⬇%20%20GET%20v1.3.1--Stable-E50914?style=for-the-badge)](https://github.com/TheARCreactorGUY/Euthopiar/releases/latest)
 
 </div>
 

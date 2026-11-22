@@ -449,7 +449,11 @@ class HomeViewModel(
         if (!isPullToRefresh && rawCatalogRows.isEmpty()) {
             _uiState.value = HomeUiState.Loading
         }
-        progressiveOffset = 0
+        progressiveOffset = if (com.euthopiar.core.util.TmdbBridge.activeRegionPreset == com.euthopiar.core.model.ContentRegionPreset.GLOBAL) {
+            com.euthopiar.core.util.TmdbBridge.INITIAL_PROGRESSIVE_RAIL_COUNT
+        } else {
+            0
+        }
         hasMoreRails = true
 
         try {
@@ -606,15 +610,15 @@ class HomeViewModel(
                     rowsByTab = rowsMap
                 )
 
-                // 5. Preload images asynchronously in background without blocking UI
+                // 5. Preload above-the-fold hero & first two rows gently without flooding Coil's network queue
                 viewModelScope.launch(Dispatchers.IO) {
                     val app = getApplication<Application>()
                     val imageLoader = app.imageLoader
 
-                    val heroUrls = heroItems.flatMap { item ->
+                    val heroUrls = heroItems.take(2).flatMap { item ->
                         listOfNotNull(item.backdropUrl, item.logoUrl)
                     }
-                    val visiblePosterUrls = rows.take(4).flatMap { it.items.take(8) }
+                    val visiblePosterUrls = rows.take(2).flatMap { it.items.take(6) }
                         .mapNotNull { it.posterUrl }
 
                     val allPreloadUrls = (heroUrls + visiblePosterUrls).distinct()

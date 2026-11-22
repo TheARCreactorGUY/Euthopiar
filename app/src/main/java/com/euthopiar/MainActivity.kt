@@ -21,8 +21,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import com.euthopiar.core.sync.simkl.SimklClient
 import com.euthopiar.data.preferences.PreferencesRepository
 import androidx.compose.foundation.background
@@ -134,8 +137,14 @@ class MainActivity : ComponentActivity() {
             com.euthopiar.ui.splash.AppLaunchCoordinator.reset()
         }
 
-        // Ordered startup reconciliation: Google Cloud pulls tombstones first, then Trakt & Simkl sync
+        // Ordered startup reconciliation: wait until Home hydrates (or max 5s) so startup network &
+        // Room bandwidth stay dedicated to Home catalog & posters, then pull cloud tombstones first,
+        // followed by Trakt & Simkl sync.
         lifecycleScope.launch(Dispatchers.IO) {
+            withTimeoutOrNull(5_000L) {
+                com.euthopiar.ui.splash.AppLaunchCoordinator.isHomeDataReady.first { it }
+            }
+            delay(1_500L)
             try {
                 com.euthopiar.data.sync.supabase.SupabaseSyncManager.getInstance(applicationContext).syncAll()
             } catch (_: Exception) {}

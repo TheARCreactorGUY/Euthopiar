@@ -18,9 +18,11 @@ import com.euthopiar.core.util.AppSessionManager
 import com.euthopiar.data.preferences.PreferencesRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import okio.Path.Companion.toOkioPath
+import java.util.concurrent.TimeUnit
 
 class EuthopiarApp : Application(), SingletonImageLoader.Factory {
     override fun onCreate() {
@@ -31,8 +33,17 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
         prefs.edit().putInt("launch_session_index", nextIndex).apply()
         AppSessionManager.initialize(nextIndex)
 
-        // Initialize 50MB HTTP disk cache and connection pool
+        // Initialize 50MB HTTP disk cache and connection pool immediately
         DohDns.initHttpCache(cacheDir)
+
+        // Immediately warm DNS in parallel for all critical media, poster CDN, and metadata hosts
+        // BEFORE any UI, catalog, or Coil image requests fire!
+        DohDns.DEFAULT.prefetch(
+            "euthopiar-vault.sehgalvansh716.workers.dev",
+            "image.tmdb.org",
+            "api.themoviedb.org",
+            "graphql.anilist.co"
+        )
 
         // Synchronously initialize JsPluginStorage, AddonRepository, and P2P engine instances
         com.euthopiar.core.js.JsPluginStorage.getInstance(this)
@@ -41,64 +52,13 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
         com.euthopiar.core.p2p.P2pSettingsRepository.initialize(this)
         com.euthopiar.core.browser.HeadlessWebResolver.getInstance(this)
 
-        // Initialize plugins, run smart cache maintenance, sync P2P policy, prefetch DNS & restore provider
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val prefsRepo = PreferencesRepository.getInstance(this@EuthopiarApp)
-                com.euthopiar.core.p2p.P2pSettingsRepository.setP2pEnabled(prefsRepo.p2pStreamsEnabled.first())
-                launch {
-                    prefsRepo.p2pStreamsEnabled.collect { enabled ->
-                        com.euthopiar.core.p2p.P2pSettingsRepository.setP2pEnabled(enabled)
-                    }
-                }
-            } catch (_: Exception) {}
+        val appScope = CoroutineScope(Dispatchers.IO)
 
-            try {
-                com.euthopiar.data.cache.AppCacheManager.runAutomaticMaintenance(this@EuthopiarApp)
-            } catch (_: Exception) {}
+        // Critical startup path: initialize plugins & restore active provider immediately
+        appScope.launch {
             try {
                 com.euthopiar.core.js.JsPluginStorage.getInstance(this@EuthopiarApp).initialize()
                 com.euthopiar.core.addons.AddonRepository.getInstance(this@EuthopiarApp).initialize()
-            } catch (_: Exception) {}
-
-            // DNS pre-fetch for critical media & metadata hosts
-            DohDns.DEFAULT.prefetch(
-                "euthopiar-vault.sehgalvansh716.workers.dev",
-                "api.themoviedb.org",
-                "image.tmdb.org",
-                "graphql.anilist.co"
-            )
-
-            try {
-                val prefsRepo = PreferencesRepository.getInstance(this@EuthopiarApp)
-                launch {
-                    kotlinx.coroutines.flow.combine(
-                        prefsRepo.debridEnabled,
-                        prefsRepo.activeDebridProvider,
-                        prefsRepo.realDebridApiKey,
-                        prefsRepo.allDebridApiKey,
-                        prefsRepo.torBoxApiKey
-                    ) { enabled, provider, rdKey, adKey, tbKey ->
-                        if (!enabled) {
-                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(emptyList())
-                            return@combine
-                        }
-                        val pType = com.euthopiar.core.debrid.DebridProviderType.fromId(provider)
-                        val key = when (pType) {
-                            com.euthopiar.core.debrid.DebridProviderType.REAL_DEBRID -> rdKey
-                            com.euthopiar.core.debrid.DebridProviderType.ALL_DEBRID -> adKey
-                            com.euthopiar.core.debrid.DebridProviderType.TORBOX -> tbKey
-                            com.euthopiar.core.debrid.DebridProviderType.NONE -> ""
-                        }
-                        if (pType != com.euthopiar.core.debrid.DebridProviderType.NONE && key.isNotBlank()) {
-                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(
-                                listOf(com.euthopiar.core.debrid.DebridManager.ActiveDebridProvider(pType, true))
-                            )
-                        } else {
-                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(emptyList())
-                        }
-                    }.collect { }
-                }
             } catch (_: Exception) {}
 
             try {
@@ -128,7 +88,9 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
                 }
             } catch (_: Exception) {}
 
-            launch(Dispatchers.IO) {
+            // Non-blocking plugin auto-update check after startup settles
+            launch {
+                delay(6_000L)
                 try {
                     val updated = PluginRepositoryService.getInstance(this@EuthopiarApp)
                         .checkAndAutoUpdatePlugins(installNewFromRepos = false)
@@ -140,14 +102,65 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
                 }
             }
         }
+
+        // Independent preference observers (P2P policy & Debrid) — never block plugin init
+        appScope.launch {
+            try {
+                val prefsRepo = PreferencesRepository.getInstance(this@EuthopiarApp)
+                launch {
+                    prefsRepo.p2pStreamsEnabled.collect { enabled ->
+                        com.euthopiar.core.p2p.P2pSettingsRepository.setP2pEnabled(enabled)
+                    }
+                }
+                launch {
+                    kotlinx.coroutines.flow.combine(
+                        prefsRepo.debridEnabled,
+                        prefsRepo.activeDebridProvider,
+                        prefsRepo.realDebridApiKey,
+                        prefsRepo.allDebridApiKey,
+                        prefsRepo.torBoxApiKey
+                    ) { enabled, provider, rdKey, adKey, tbKey ->
+                        if (!enabled) {
+                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(emptyList())
+                            return@combine
+                        }
+                        val pType = com.euthopiar.core.debrid.DebridProviderType.fromId(provider)
+                        val key = when (pType) {
+                            com.euthopiar.core.debrid.DebridProviderType.REAL_DEBRID -> rdKey
+                            com.euthopiar.core.debrid.DebridProviderType.ALL_DEBRID -> adKey
+                            com.euthopiar.core.debrid.DebridProviderType.TORBOX -> tbKey
+                            com.euthopiar.core.debrid.DebridProviderType.NONE -> ""
+                        }
+                        if (pType != com.euthopiar.core.debrid.DebridProviderType.NONE && key.isNotBlank()) {
+                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(
+                                listOf(com.euthopiar.core.debrid.DebridManager.ActiveDebridProvider(pType, true))
+                            )
+                        } else {
+                            com.euthopiar.core.debrid.DebridManager.getInstance().setActiveProviders(emptyList())
+                        }
+                    }.collect { }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Deferred smart cache maintenance: runs well after Home catalog & posters finish hydrating
+        // so it NEVER competes with startup disk I/O or network fetches.
+        appScope.launch {
+            delay(20_000L)
+            try {
+                com.euthopiar.data.cache.AppCacheManager.runAutomaticMaintenance(this@EuthopiarApp)
+            } catch (_: Exception) {}
+        }
     }
 
     private val imageHttpClient by lazy {
         DohDns.sharedBaseClient.newBuilder()
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
             .dispatcher(
                 okhttp3.Dispatcher().apply {
                     maxRequests = 64
-                    maxRequestsPerHost = 16
+                    maxRequestsPerHost = 20
                 }
             )
             .addInterceptor { chain ->
@@ -206,7 +219,10 @@ class EuthopiarApp : Application(), SingletonImageLoader.Factory {
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+        // Coil 3 trims memory proportionally on routine trim events.
+        // Only clear the entire bitmap cache under extreme background eviction pressure
+        // so browsing between Home, Details, Search, and Library never forces poster reloads.
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE) {
             runCatching {
                 coil3.SingletonImageLoader.get(this).memoryCache?.clear()
             }
